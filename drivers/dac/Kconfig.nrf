@@ -1,0 +1,6 @@
+config DAC_NRF
+	bool "NRF DAC driver"
+	default y
+	depends on DT_HAS_NORDIC_NRF_DAC_ENABLED
+	help
+	  Enable the driver implementation for the nRF DAC

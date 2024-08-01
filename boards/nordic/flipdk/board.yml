@@ -1,0 +1,5 @@
+board:  
+  name: flipdk
+  vendor: nordic
+  socs:
+  - name: flip

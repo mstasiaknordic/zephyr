@@ -10,7 +10,7 @@ done
 
 FLIP_DIR="/home/mstasiaknordic/workspace/dacflip"
 echo "------ BUILDING SAMPLE ------"
-west build -p -b flip//cpuapp
+west build -p -b flipdk/flip/cpuapp
 
 cp build/zephyr/zephyr.elf $FLIP_DIR
 cd $FLIP_DIR

@@ -1,0 +1,13 @@
+# FLIP emulated board configuration
+
+# Copyright (c) 2024 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+if BOARD_FLIPDK_FLIP_CPUAPP
+
+config BOARD_ENABLE_DCDC
+	bool "DCDC mode"
+	select SOC_NRF54L_VREG_MAIN_DCDC
+	default y
+
+endif # BOARD_FLIPDK_FLIP_CPUAPP
