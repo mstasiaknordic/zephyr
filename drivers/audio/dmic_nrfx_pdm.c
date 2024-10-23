@@ -8,6 +8,7 @@
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <soc.h>
+#include <dmm.h>
 #include <nrfx_pdm.h>
 
 #include <zephyr/logging/log.h>
@@ -15,8 +16,13 @@
 LOG_MODULE_REGISTER(dmic_nrfx_pdm, CONFIG_AUDIO_DMIC_LOG_LEVEL);
 
 struct dmic_nrfx_pdm_drv_data {
-	const nrfx_pdm_t *pdm;
+#if defined(CONFIG_CLOCK_CONTROL_NRF2)
+	struct nrf_clock_spec *clock_spec;
+	const struct device *clock;
+#else
 	struct onoff_manager *clk_mgr;
+#endif
+	const nrfx_pdm_t *pdm;
 	struct onoff_client clk_cli;
 	struct k_mem_slab *mem_slab;
 	uint32_t block_size;
@@ -36,6 +42,7 @@ struct dmic_nrfx_pdm_drv_cfg {
 		PCLK32M_HFXO,
 		ACLK
 	} clk_src;
+	void *mem_reg;
 };
 
 static void free_buffer(struct dmic_nrfx_pdm_drv_data *drv_data, void *buffer)
@@ -47,6 +54,7 @@ static void free_buffer(struct dmic_nrfx_pdm_drv_data *drv_data, void *buffer)
 static void event_handler(const struct device *dev, const nrfx_pdm_evt_t *evt)
 {
 	struct dmic_nrfx_pdm_drv_data *drv_data = dev->data;
+	const struct dmic_nrfx_pdm_drv_cfg *drv_cfg = dev->config;
 	int ret;
 	bool stop = false;
 
@@ -59,6 +67,14 @@ static void event_handler(const struct device *dev, const nrfx_pdm_evt_t *evt)
 			LOG_ERR("Failed to allocate buffer: %d", ret);
 			stop = true;
 		} else {
+
+			ret = dmm_buffer_in_prepare(drv_cfg->mem_reg, (void *)drv_data->mem_slab->buffer,
+						    drv_data->block_size, &buffer);
+			if (ret) {
+				LOG_ERR("Failed to prepare buffer: %d", ret);
+				stop = true;
+				goto stop_pdm;
+			}
 			err = nrfx_pdm_buffer_set(drv_data->pdm, buffer, drv_data->block_size / 2);
 			if (err != NRFX_SUCCESS) {
 				LOG_ERR("Failed to set buffer: 0x%08x", err);
@@ -69,13 +85,21 @@ static void event_handler(const struct device *dev, const nrfx_pdm_evt_t *evt)
 
 	if (drv_data->stopping) {
 		if (evt->buffer_released) {
+			ret = dmm_buffer_in_release(drv_cfg->mem_reg, (void *)drv_data->mem_slab->buffer,
+						    drv_data->block_size, (void *)&evt->buffer_released);
+			if (ret) {
+				LOG_ERR("Failed to release buffer: %d", ret);
+				stop = true;
+				goto stop_pdm;
+			}
 			free_buffer(drv_data, evt->buffer_released);
 		}
 
 		if (drv_data->active) {
 			drv_data->active = false;
 			if (drv_data->request_clock) {
-				(void)onoff_release(drv_data->clk_mgr);
+				// (void)onoff_release(drv_data->clk_mgr);
+				nrf_clock_control_release(drv_data->clock, drv_data->clock_spec);
 			}
 		}
 	} else if (evt->buffer_released) {
@@ -85,13 +109,18 @@ static void event_handler(const struct device *dev, const nrfx_pdm_evt_t *evt)
 		if (ret < 0) {
 			LOG_ERR("No room in RX queue");
 			stop = true;
-
+			ret = dmm_buffer_in_release(drv_cfg->mem_reg, (void *)drv_data->mem_slab->buffer,
+						    drv_data->block_size, (void *)&evt->buffer_released);
+			if (ret) {
+				LOG_ERR("Failed to release buffer: %d", ret);
+				goto stop_pdm;
+			}
 			free_buffer(drv_data, evt->buffer_released);
 		} else {
 			LOG_DBG("Queued buffer %p", evt->buffer_released);
 		}
 	}
-
+stop_pdm:
 	if (stop) {
 		drv_data->stopping = true;
 		nrfx_pdm_stop(drv_data->pdm);
@@ -168,7 +197,7 @@ static bool check_pdm_frequencies(const struct dmic_nrfx_pdm_drv_cfg *drv_cfg,
 		better_found = true;
 	}
 #else
-	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF53X)) {
+	if (IS_ENABLED(CONFIG_SOC_SERIES_NRF53X) || IS_ENABLED(CONFIG_SOC_SERIES_NRF54HX)) {
 		const uint32_t src_freq =
 			(NRF_PDM_HAS_MCLKCONFIG && drv_cfg->clk_src == ACLK)
 			/* The DMIC_NRFX_PDM_DEVICE() macro contains build
@@ -447,7 +476,8 @@ static int start_transfer(struct dmic_nrfx_pdm_drv_data *drv_data)
 	ret =  -EIO;
 
 	if (drv_data->request_clock) {
-		(void)onoff_release(drv_data->clk_mgr);
+		// (void)onoff_release(drv_data->clk_mgr);
+		nrf_clock_control_release(drv_data->clock, drv_data->clock_spec);
 	}
 
 	drv_data->active = false;
@@ -467,7 +497,8 @@ static void clock_started_callback(struct onoff_manager *mgr,
 	 * the actual transfer in such case.
 	 */
 	if (!drv_data->active) {
-		(void)onoff_release(drv_data->clk_mgr);
+		// (void)onoff_release(drv_data->clk_mgr);
+		nrf_clock_control_release(drv_data->clock, drv_data->clock_spec);
 	} else {
 		(void)start_transfer(drv_data);
 	}
@@ -486,7 +517,8 @@ static int trigger_start(const struct device *dev)
 	if (drv_data->request_clock) {
 		sys_notify_init_callback(&drv_data->clk_cli.notify,
 					 clock_started_callback);
-		ret = onoff_request(drv_data->clk_mgr, &drv_data->clk_cli);
+		// ret = onoff_request(drv_data->clk_mgr, &drv_data->clk_cli);
+		ret = nrf_clock_control_request(drv_data->clock, drv_data->clock_spec, &drv_data->clk_cli);
 		if (ret < 0) {
 			drv_data->active = false;
 
@@ -562,9 +594,18 @@ static int dmic_nrfx_pdm_read(const struct device *dev,
 	return ret;
 }
 
-static void init_clock_manager(const struct device *dev)
+static void init_clock(const struct device *dev)
 {
 	struct dmic_nrfx_pdm_drv_data *drv_data = dev->data;
+#if defined(CONFIG_CLOCK_CONTROL_NRF2)
+	struct nrf_clock_spec spec = {
+		.frequency = MHZ(32),
+		.accuracy = 0,
+		.precision = NRF_CLOCK_CONTROL_PRECISION_DEFAULT,
+	};
+	drv_data->clock_spec = &spec;
+	drv_data->clock = DEVICE_DT_GET(DT_NODELABEL(cpuapp_hsfll));
+#else
 	clock_control_subsys_t subsys;
 
 #if NRF_CLOCK_HAS_HFCLKAUDIO
@@ -580,6 +621,7 @@ static void init_clock_manager(const struct device *dev)
 
 	drv_data->clk_mgr = z_nrf_clock_control_get_onoff(subsys);
 	__ASSERT_NO_MSG(drv_data->clk_mgr != NULL);
+#endif /* defined(CONFIG_CLOCK_CONTROL_NRF2) */
 }
 
 static const struct _dmic_ops dmic_ops = {
@@ -609,7 +651,7 @@ static const struct _dmic_ops dmic_ops = {
 		k_msgq_init(&dmic_nrfx_pdm_data##idx.rx_queue,		     \
 			    (char *)rx_msgs##idx, sizeof(void *),	     \
 			    ARRAY_SIZE(rx_msgs##idx));			     \
-		init_clock_manager(dev);				     \
+		init_clock(dev);					     \
 		return 0;						     \
 	}								     \
 	static void event_handler##idx(const nrfx_pdm_evt_t *evt)	     \
@@ -624,6 +666,7 @@ static const struct _dmic_ops dmic_ops = {
 		.nrfx_def_cfg.skip_psel_cfg = true,			     \
 		.pcfg = PINCTRL_DT_DEV_CONFIG_GET(PDM(idx)),		     \
 		.clk_src = PDM_CLK_SRC(idx),				     \
+		.mem_reg = DMM_DEV_TO_REG(PDM(idx)),			     \
 	};								     \
 	BUILD_ASSERT(PDM_CLK_SRC(idx) != ACLK || NRF_PDM_HAS_MCLKCONFIG,     \
 		"Clock source ACLK is not available.");			     \
