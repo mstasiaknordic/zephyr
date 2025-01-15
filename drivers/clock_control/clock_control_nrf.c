@@ -79,6 +79,9 @@ struct nrf_clock_control_config {
 static atomic_t hfclk_users;
 static uint64_t hf_start_tstamp;
 static uint64_t hf_stop_tstamp;
+#if CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH
+static bool keep_hfxo; /* If true, HFXO is running only to synthesize low frequency clock. */
+#endif
 
 static struct nrf_clock_control_sub_data *get_sub_data(const struct device *dev,
 						       enum clock_control_nrf_type type)
@@ -202,6 +205,11 @@ static void lfclk_start(void)
 		anomaly_132_workaround();
 	}
 
+#if CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH
+	nrfx_clock_hfclk_start();
+	keep_hfxo = true;
+#endif
+
 	nrfx_clock_lfclk_start();
 }
 
@@ -212,10 +220,23 @@ static void lfclk_stop(void)
 	}
 
 	nrfx_clock_lfclk_stop();
+
+#if CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH
+	if (keep_hfxo) {
+		nrfx_clock_hfclk_stop();
+		keep_hfxo = false;
+	}
+#endif
 }
 
 static void hfclk_start(void)
 {
+#if CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH
+	if (keep_hfxo) {
+		keep_hfxo = false;
+		return;
+	}
+#endif
 	if (IS_ENABLED(CONFIG_CLOCK_CONTROL_NRF_SHELL)) {
 		hf_start_tstamp = k_uptime_get();
 	}
@@ -230,6 +251,10 @@ static void hfclk_stop(void)
 	}
 
 	nrfx_clock_hfclk_stop();
+
+#if CONFIG_CLOCK_CONTROL_NRF_K32SRC_SYNTH
+	keep_hfxo = false;
+#endif
 }
 
 #if NRF_CLOCK_HAS_HFCLK192M
