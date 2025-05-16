@@ -126,3 +126,12 @@ config UART_$(nrfx_uart_num)_A2I_RX_BUF_COUNT
 	default 0
 	help
 	  Number of chunks into RX space is divided.
+
+config UART_$(nrfx_uart_num)_HAS_CROSS_DOMAIN_PINS
+	bool
+	depends on (SOC_NRF54L05 || SOC_NRF54L10 || SOC_NRF54L15)
+	default $(nrfx_uart_num) = 20 || $(nrfx_uart_num) = 21
+	select NRFX_POWER if $(nrfx_uart_num) = 20 || $(nrfx_uart_num) = 21
+	help
+	  Option indicating whether UARTE instance supports usage of pins
+	  in domain different from the instance.
