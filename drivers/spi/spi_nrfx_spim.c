@@ -25,6 +25,8 @@
 #include <nrfx_spim.h>
 #include <string.h>
 #include <zephyr/linker/devicetree_regions.h>
+#include <hal/nrf_gpio.h>
+#include <nrfx_power.h>
 
 #include <zephyr/logging/log.h>
 #include <zephyr/irq.h>
@@ -43,6 +45,14 @@ LOG_MODULE_REGISTER(spi_nrfx_spim, CONFIG_SPI_LOG_LEVEL);
 #define SPI_BUFFER_IN_RAM 1
 #endif
 
+/*
+ * We use NODELABEL here because the nrfx API requires us to call
+ * functions which are named according to SoC peripheral instance
+ * being operated on. Since DT_INST() makes no guarantees about that,
+ * it won't work.
+ */
+#define SPIM(idx)			DT_NODELABEL(spi##idx)
+
 #if defined(CONFIG_CLOCK_CONTROL_NRF2_GLOBAL_HSFLL)
 #define SPIM_REQUESTS_CLOCK(node) \
 	DT_NODE_HAS_COMPAT(DT_NODELABEL(DT_CLOCKS_CTLR(node)), nordic_nrf_hsfll_global)
@@ -58,6 +68,13 @@ BUILD_ASSERT(!IS_ENABLED(CONFIG_PM_DEVICE_SYSTEM_MANAGED));
 #else
 #define SPIM_REQUESTS_CLOCK(idx) 0
 #endif
+
+#define SPIM_PINS_CROSS_DOMAIN(unused, prefix, idx, _)				\
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(SPIM(prefix##idx)),			\
+	    (IS_ENABLED(CONFIG_SPI_##prefix##idx##_HAS_CROSS_DOMAIN_PINS)),	\
+	    (0))
+
+#define SPIM_ANY_PINS_CROSS_DOMAIN (NRFX_FOREACH_PRESENT(SPIM, SPIM_PINS_CROSS_DOMAIN, (||), (0)))
 
 struct spi_nrfx_data {
 	struct spi_context ctx;
@@ -97,6 +114,9 @@ struct spi_nrfx_config {
 #ifdef USE_CLOCK_REQUESTS
 	const struct device *clk_dev;
 	struct nrf_clock_spec clk_spec;
+#endif
+#if SPIM_ANY_PINS_CROSS_DOMAIN
+	bool cross_domain;
 #endif
 };
 
@@ -147,6 +167,30 @@ static inline void release_clock(const struct device *dev)
 #endif
 }
 
+#if SPIM_ANY_PINS_CROSS_DOMAIN
+static bool spim_has_cross_domain_connection(const struct pinctrl_dev_config *pcfg)
+{
+	const struct pinctrl_state *state;
+	int ret;
+
+	ret = pinctrl_lookup_state(pcfg, PINCTRL_STATE_DEFAULT, &state);
+	if (ret < 0) {
+		LOG_ERR("Unable to read pin state");
+		return false;
+	}
+
+	for (uint8_t i = 0U; i < state->pin_cnt; i++) {
+		uint32_t pin = NRF_GET_PIN(state->pins[i]);
+
+		if (nrf_gpio_pin_port_number_extract(&pin) == 2) {
+			return true;
+		}
+	}
+
+	return false;
+}
+#endif
+
 static inline void finalize_spi_transaction(const struct device *dev, bool deactivate_cs)
 {
 	struct spi_nrfx_data *dev_data = dev->data;
@@ -154,12 +198,7 @@ static inline void finalize_spi_transaction(const struct device *dev, bool deact
 	void *reg = dev_config->spim.p_reg;
 
 	if (deactivate_cs) {
-		/*
-		 * We may suspend SPI only if we don't have to keep CS asserted, as we
-		 * need to keep the CS GPIO port resumed until spi_release() in this case.
-		 */
 		spi_context_cs_control(&dev_data->ctx, false);
-		pm_device_runtime_put_async(dev, K_NO_WAIT);
 	}
 
 	if (NRF_SPIM_IS_320MHZ_SPIM(reg) && !(dev_data->ctx.config->operation & SPI_HOLD_ON_CS)) {
@@ -169,6 +208,8 @@ static inline void finalize_spi_transaction(const struct device *dev, bool deact
 	if (!IS_ENABLED(CONFIG_PM_DEVICE_RUNTIME)) {
 		release_clock(dev);
 	}
+
+	pm_device_runtime_put_async(dev, K_NO_WAIT);
 }
 
 static inline uint32_t get_nrf_spim_frequency(uint32_t frequency)
@@ -406,7 +447,7 @@ static void finish_transaction(const struct device *dev, int error)
 	spi_context_complete(ctx, dev, error);
 	dev_data->busy = false;
 
-	finalize_spi_transaction(dev, (dev_data->ctx.config->operation & SPI_HOLD_ON_CS) > 0);
+	finalize_spi_transaction(dev, true);
 }
 
 static void transfer_next_chunk(const struct device *dev)
@@ -665,19 +706,23 @@ static DEVICE_API(spi, spi_nrfx_driver_api) = {
 static int spim_resume(const struct device *dev)
 {
 	const struct spi_nrfx_config *dev_config = dev->config;
-	struct spi_nrfx_data *dev_data = dev->data;
 
 	(void)pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
 	/* nrfx_spim_init() will be called at configuration before
 	 * the next transfer.
 	 */
 
-	if (spi_context_cs_get_all(&dev_data->ctx)) {
-		return -EAGAIN;
-	}
-
 #ifdef CONFIG_SOC_NRF54H20_GPD
 	nrf_gpd_retain_pins_set(dev_config->pcfg, false);
+#endif
+#if SPIM_ANY_PINS_CROSS_DOMAIN
+	if(dev_config->cross_domain && spim_has_cross_domain_connection(dev_config->pcfg)) {
+		int err;
+
+		err = nrfx_power_constlat_mode_request();
+		(void)err;
+		__ASSERT_NO_MSG(err >= 0);
+	}
 #endif
 
 	return IS_ENABLED(CONFIG_PM_DEVICE_RUNTIME) ? request_clock(dev) : 0;
@@ -697,10 +742,17 @@ static void spim_suspend(const struct device *dev)
 		release_clock(dev);
 	}
 
-	spi_context_cs_put_all(&dev_data->ctx);
-
 #ifdef CONFIG_SOC_NRF54H20_GPD
 	nrf_gpd_retain_pins_set(dev_config->pcfg, true);
+#endif
+#if SPIM_ANY_PINS_CROSS_DOMAIN
+	if(dev_config->cross_domain && spim_has_cross_domain_connection(dev_config->pcfg)) {
+		int err;
+
+		err = nrfx_power_constlat_mode_free();
+		(void)err;
+		__ASSERT_NO_MSG(err >= 0);
+	}
 #endif
 
 	(void)pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_SLEEP);
@@ -759,13 +811,7 @@ static int spi_nrfx_init(const struct device *dev)
 #endif
 	return pm_device_driver_init(dev, spim_nrfx_pm_action);
 }
-/*
- * We use NODELABEL here because the nrfx API requires us to call
- * functions which are named according to SoC peripheral instance
- * being operated on. Since DT_INST() makes no guarantees about that,
- * it won't work.
- */
-#define SPIM(idx)			DT_NODELABEL(spi##idx)
+
 #define SPIM_PROP(idx, prop)		DT_PROP(SPIM(idx), prop)
 #define SPIM_HAS_PROP(idx, prop)	DT_NODE_HAS_PROP(SPIM(idx), prop)
 #define SPIM_MEM_REGION(idx)		DT_PHANDLE(SPIM(idx), memory_regions)
@@ -857,6 +903,8 @@ static int spi_nrfx_init(const struct device *dev)
 			 .clk_spec = {					       \
 				.frequency = NRF_CLOCK_CONTROL_FREQUENCY_MAX,  \
 			 },))						       \
+		COND_CODE_1(SPIM_PINS_CROSS_DOMAIN(_, /*empty*/, idx, _),      \
+			(.cross_domain = true,), ())			       \
 	};								       \
 	BUILD_ASSERT(!SPIM_HAS_PROP(idx, wake_gpios) ||			       \
 		     !(DT_GPIO_FLAGS(SPIM(idx), wake_gpios) & GPIO_ACTIVE_LOW),\

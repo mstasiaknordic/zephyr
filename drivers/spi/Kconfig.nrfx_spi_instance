@@ -1,0 +1,13 @@
+# nRF SPI(M/S) instance configuration
+
+# Copyright (c) 2025 Nordic Semiconductor ASA
+# SPDX-License-Identifier: Apache-2.0
+
+config SPI_$(nrfx_spi_num)_HAS_CROSS_DOMAIN_PINS
+	bool
+	depends on (SOC_NRF54L05 || SOC_NRF54L10 || SOC_NRF54L15)
+	default $(nrfx_spi_num) = 20 || $(nrfx_spi_num) = 21
+	select NRFX_POWER if $(nrfx_spi_num) = 20 || $(nrfx_spi_num) = 21
+	help
+	  Option indicating whether SPI instance supports usage of pins
+	  in domain different from the instance.

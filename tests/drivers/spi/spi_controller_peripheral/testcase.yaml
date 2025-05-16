@@ -68,6 +68,13 @@ tests:
       - nrf54l20pdk/nrf54l20/cpuapp
       - ophelia4ev/nrf54l15/cpuapp
 
+  drivers.spi.spi_cross_domain:
+    extra_configs:
+      - CONFIG_TESTED_SPI_MODE=0
+    extra_args: DTC_OVERLAY_FILE="boards/nrf54l15dk_nrf54l15_cpuapp_cross_domain.overlay"
+    platform_allow:
+      - nrf54l15dk/nrf54l15/cpuapp
+
   drivers.spi.spis_fast:
     # SPIS120 instance occupies P6 which is not available on nRF54H20 DK pin headers
     # It is added only to check the compilation.

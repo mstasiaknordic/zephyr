@@ -113,4 +113,14 @@ config SPI_NRFX_WAKE_TIMEOUT_US
 	  by instances that have the WAKE line configured (see the wake-gpios
 	  devicetree property).
 
+if HAS_HW_NRF_SPIM20 || HAS_HW_NRF_SPIM21
+nrfx_spi_num = 20
+rsource "Kconfig.nrfx_spi_instance"
+endif
+
+if HAS_HW_NRF_SPIM20 || HAS_HW_NRF_SPIM21
+nrfx_spi_num = 21
+rsource "Kconfig.nrfx_spi_instance"
+endif
+
 endif # SPI_NRFX
